@@ -1,0 +1,5 @@
+token: ""
+guild_id: ""
+csv_output: "inactive_members.csv"
+inactivity_days: 60
+debug: false
