@@ -1,23 +1,23 @@
 package main
 
 import (
-        "encoding/csv"
-        "fmt"
-        "log"
-        "os"
-        "time"
+	"encoding/csv"
+	"fmt"
+	"log"
+	"os"
+	"time"
 
-        "gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v3"
 
-        "github.com/bwmarrin/discordgo"
+	"github.com/bwmarrin/discordgo"
 )
 
 type Config struct {
-        Token          string `yaml:"token"`
-        GuildID        string `yaml:"guild_id"`
-        CSVOutput      string `yaml:"csv_output"`
-        InactivityDays int    `yaml:"inactivity_days"`
-        Debug          bool   `yaml:"debug"`
+	Token          string `yaml:"token"`
+	GuildID        string `yaml:"guild_id"`
+	CSVOutput      string `yaml:"csv_output"`
+	InactivityDays int    `yaml:"inactivity_days"`
+	Debug          bool   `yaml:"debug"`
 }
 
 func main() {
@@ -43,15 +43,6 @@ func main() {
 	defer dg.Close()
 
 	fmt.Println("Bot is now running. Fetching guild information...")
-
-	// Get the guild (server) by ID
-	guild, err := dg.Guild(config.GuildID)
-	if err != nil {
-		log.Fatalf("Error fetching guild: %v", err)
-		return
-	}
-
-	fmt.Printf("Connected to guild: %s (%s)\n", guild.Name, config.GuildID)
 
 	// Fetch the channels directly using the Discord API
 	channels, err := dg.GuildChannels(config.GuildID)
@@ -117,7 +108,36 @@ func main() {
 		}
 	}
 
-	// Prepare CSV output
+	// Manually fetch all guild members
+	fmt.Println("Fetching all guild members...")
+
+	var allMembers []*discordgo.Member
+	after := ""
+
+	for {
+		members, err := dg.GuildMembers(config.GuildID, after, 1000)
+		if err != nil {
+			log.Fatalf("Error fetching guild members: %v", err)
+		}
+
+		if len(members) == 0 {
+			break
+		}
+
+		allMembers = append(allMembers, members...)
+		after = members[len(members)-1].User.ID
+
+		fmt.Printf("Fetched %d members, total so far: %d\n", len(members), len(allMembers))
+
+		// If we've fetched fewer than 1000 members, we're done
+		if len(members) < 1000 {
+			break
+		}
+	}
+
+	fmt.Printf("Total members fetched: %d\n", len(allMembers))
+
+	// Prepare CSV output for inactive users
 	file, err := os.Create(config.CSVOutput)
 	if err != nil {
 		log.Fatalf("Could not create CSV file: %v", err)
@@ -128,13 +148,30 @@ func main() {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write header
+	// Write header for inactive users CSV
 	writer.Write([]string{"Username", "Last Message Time"})
 
-	fmt.Println("Evaluating each member's activity...")
+	var activeWriter *csv.Writer
+	if config.Debug {
+		// Prepare CSV output for active users if debug is enabled
+		activeFile, err := os.Create("active_users.csv")
+		if err != nil {
+			log.Fatalf("Could not create active users CSV file: %v", err)
+			return
+		}
+		defer activeFile.Close()
 
-	// Evaluate each member's activity
-	for _, member := range guild.Members {
+		activeWriter = csv.NewWriter(activeFile)
+		defer activeWriter.Flush()
+
+		// Write header for active users CSV
+		activeWriter.Write([]string{"Username", "Last Message Time"})
+	}
+
+	fmt.Println("Starting to evaluate each member's activity...")
+
+	// Evaluate each member's activity using the manually fetched members
+	for _, member := range allMembers {
 		if member.User.Bot {
 			if config.Debug {
 				fmt.Printf("Skipping bot user: %s\n", member.User.Username)
@@ -143,20 +180,35 @@ func main() {
 		}
 
 		lastMessageTime, exists := lastMessageTimes[member.User.ID]
+		if config.Debug {
+			fmt.Printf("Evaluating user: %s (ID: %s), Last Message Time exists: %t, Time: %v\n", member.User.Username, member.User.ID, exists, lastMessageTime)
+		}
+
 		if !exists {
 			// User has never sent a message
 			writer.Write([]string{member.User.Username, "Never sent a message"})
-			fmt.Printf("User %s has never sent a message, added to list as inactive.\n", member.User.Username)
+			if config.Debug {
+				fmt.Printf("User %s has never sent a message, added to list as inactive.\n", member.User.Username)
+			}
 		} else if lastMessageTime.Before(inactiveThreshold) {
 			// User has been inactive
 			writer.Write([]string{member.User.Username, lastMessageTime.Format(time.RFC3339)})
-			fmt.Printf("User %s has been inactive since %s, added to list.\n", member.User.Username, lastMessageTime)
-		} else if config.Debug {
-			fmt.Printf("User %s is active, last message on %s.\n", member.User.Username, lastMessageTime)
+			if config.Debug {
+				fmt.Printf("User %s has been inactive since %s, added to list as inactive.\n", member.User.Username, lastMessageTime)
+			}
+		} else {
+			// User is active
+			if config.Debug && activeWriter != nil {
+				activeWriter.Write([]string{member.User.Username, lastMessageTime.Format(time.RFC3339)})
+				fmt.Printf("User %s is active, last message on %s, added to active list.\n", member.User.Username, lastMessageTime)
+			}
 		}
 	}
 
 	fmt.Printf("Saved inactive members to %s\n", config.CSVOutput)
+	if config.Debug {
+		fmt.Println("Saved active members to active_users.csv")
+	}
 }
 
 // fetchChannelMessages fetches messages from a channel after a specific timestamp.
@@ -177,8 +229,13 @@ func fetchChannelMessages(s *discordgo.Session, channelID string, after time.Tim
 		}
 
 		for _, msg := range messages {
+			// Skip messages from bots for debug output
+			if msg.Author.Bot {
+				continue
+			}
+
 			if debug {
-				// Output each message as it is fetched
+				// Output each non-bot message as it is fetched
 				fmt.Printf("Fetched message: Author=%s, Timestamp=%s, Content=%s\n", msg.Author.Username, msg.Timestamp, msg.Content)
 			}
 
@@ -203,6 +260,8 @@ func fetchChannelMessages(s *discordgo.Session, channelID string, after time.Tim
 // processMessages processes messages and updates the last message time for users
 func processMessages(messages []*discordgo.Message, lastMessageTimes map[string]time.Time, debug bool, location string) {
 	totalMessages := len(messages)
+	fmt.Printf("Parsing %d total messages in %s.\n", totalMessages, location) // Corrected to use %d for integer
+
 	for i, msg := range messages {
 		if debug {
 			fmt.Printf("Reviewing message in %s: Author=%s, Timestamp=%s, Content=%s\n", location, msg.Author.Username, msg.Timestamp, msg.Content)
